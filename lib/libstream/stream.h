@@ -91,7 +91,7 @@ unsigned sdm_stream_get_sample_size(sdm_stream_t *stream);
 
 //! Open stream.
 //! @param stream output stream object.
-int sdm_stream_open(sdm_stream_t *stream);
+extern int sdm_stream_open(sdm_stream_t *stream);
 
 //! Close stream.
 //! @param stream output stream object.

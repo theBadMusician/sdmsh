@@ -8,6 +8,8 @@
 #include <libgen.h> /* basename() */
 #include <unistd.h> /* ssize_t */
 
+#include "sdm.h"
+
 #define CACHE_SIZE (16*2)
 
 #define FATAL_LOG            0x0001
@@ -239,9 +241,9 @@ extern unsigned long log_level;
 # warning "LOGGER disable..."
 #endif
 
-int logger_init(const char log_name_[],int limit_flag, ...);
-int logger_init_fd(int fd, int limit_flag_,...);
-int logger_(const char *msg, ...);
+extern int logger_init(const char log_name_[],int limit_flag, ...);
+extern int logger_init_fd(int fd, int limit_flag_,...);
+extern int logger_(const char *msg, ...);
 
 void hex_dump(FILE *f, char buf[], unsigned int len);
 void hex_dump_short(FILE *f, char buf[], unsigned int len);

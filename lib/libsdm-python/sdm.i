@@ -18,12 +18,12 @@
 }
 
 %{
-#include <sdm.h>
+#include "sdm.h"
 #include <stdio.h> /* fopen() */
 #include <utils.h> /* logger() */
 %}
 
-%include <sdm.h>
+%include "sdm.h"
 
 %typemap(in) (size_t len, uint16_t *data) {
     int i;

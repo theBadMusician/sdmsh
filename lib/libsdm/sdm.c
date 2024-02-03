@@ -12,7 +12,7 @@
 #include <assert.h>
 #include <limits.h>    /* SHORT_MAX  */
 
-#include <sdm.h>
+#include "sdm.h"
 
 #include <stream.h>
 #include <error.h>

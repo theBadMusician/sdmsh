@@ -21,6 +21,14 @@
 #define SDM_PKG_MAGIC 0x80007fff00000000UL
 #endif
 
+// #ifdef __GNUC__
+// extern unsigned long log_level __attribute__((visibility("default")));
+// #else
+// extern unsigned long log_level;
+// #endif
+
+extern unsigned long log_level; // __attribute__((visibility("default")));
+
 enum {
     SDM_CMD_STOP        = 0,
     SDM_CMD_TX          = 1,
@@ -69,16 +77,16 @@ typedef struct sdm_pkt_t {
         struct {
             uint16_t threshold;
             uint8_t  gain_and_srclvl;
-        } __attribute__((packed));
+        };
         struct {
             uint16_t param;
             uint8_t  dummy;
-        } __attribute__((packed));
+        };
         char rx_len[3];
     };
     uint32_t data_len; /* in 16bit words */
     uint16_t data[0];
-} __attribute__((packed)) sdm_pkt_t;
+} sdm_pkt_t;
 
 enum {
     SDM_STATE_INIT = 1,
@@ -108,6 +116,8 @@ typedef struct {
     int data_len;
 
     sdm_pkt_t cmd; /* last received command */
+
+    char *filename;
 } sdm_session_t;
 
 sdm_session_t* sdm_connect(char *host, int port);
@@ -128,7 +138,7 @@ int       sdm_save_samples(sdm_session_t *ss, char *buf, size_t len);
 int sdm_load_samples(sdm_session_t *ss, int16_t *samples, size_t len);
 int sdm_free_streams(sdm_session_t *ss);
 
-const char* strrpbrk(const char *s, const char *accept_only);
+// const char* strrpbrk(const char *s, const char *accept_only);
 
 char* sdm_cmd_to_str(uint8_t cmd);
 char* sdm_reply_to_str(uint8_t cmd);
