@@ -2,6 +2,7 @@ PROJ = sdm
 LIBSDM_DIR     = ../..
 LIBSTREAM_DIR  = ../../../libstream
 LIBS  = -L$(LIBSDM_DIR) -I$(LIBSDM_DIR) -L$(LIBSTREAM_DIR) -I$(LIBSTREAM_DIR)
+OBJS = $(LIBSDM_DIR)/sdm.o $(LIBSDM_DIR)/janus/janus.o $(LIBSTREAM_DIR)/stream.o $(LIBSDM_DIR)/utils.o $(LIBSTREAM_DIR)/stream_raw.o $(LIBSTREAM_DIR)/stream_ascii.o $(LIBSTREAM_DIR)/stream_popen.o $(LIBSTREAM_DIR)/stream_tcp.o
 PYTHON_INC = /usr/include/python3.10
 TESTS_BASE = tests
 TEST = usbl
@@ -22,8 +23,8 @@ $(WRAP_SRC): $(PROJ).i
 	#swig -python -debug-tmsearch -I$(LIBSDM_DIR) $(PROJ).i
 	swig -v -Wall $(SWIG_OPT) -I$(LIBSDM_DIR) -I$(LIBSTREAM_DIR) $(PROJ).i
 
-_$(PROJ).so: $(WRAP_SRC)
-	$(CC) $(LIBS) -I$(PYTHON_INC) -shared -fPIC -l$(PROJ) -o $@ $(WRAP_SRC)
+_$(PROJ).so: $(PROJ)_wrap.c
+	$(CC) -DLOGGER_ENABLED $(LIBS) -I$(PYTHON_INC) -shared -fPIC -l$(PROJ) $(OBJS) -o $@ $(WRAP_SRC)
 
 .PHONY: lib
 lib:
