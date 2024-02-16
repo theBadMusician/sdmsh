@@ -1,6 +1,12 @@
 *.o
+*.a
+*.so
 *~
 .*.sw?
 cscope.out
 tags
 .gitignore
+__pycache__/
+sdm_wrap.c
+sdm.py
+sdmsh
