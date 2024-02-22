@@ -16,11 +16,12 @@
 #define ERR_LOG              0x0002
 #define WARN_LOG             0x0004
 #define INFO_LOG             0x0008
-#define DEBUG_LOG            0x0010
-#define TRACE_LOG            0x0020
-#define DATA_LOG             0x0040
-#define LOCATION_LOG         0x0080
-#define ASYNC_LOG            0x0100
+#define NOTE_LOG             0x0010
+#define DEBUG_LOG            0x0020
+#define TRACE_LOG            0x0040
+#define DATA_LOG             0x0080
+#define LOCATION_LOG         0x0100
+#define ASYNC_LOG            0x0200
 
 #ifndef NO_COLORS
 
@@ -57,9 +58,6 @@
 #define GRAY
 
 #endif
-
-
-#ifdef LOGGER_ENABLED
 
 #include <ctype.h>
 #include <errno.h>
@@ -98,18 +96,6 @@
         }                                       \
     }while(0)
 
-#if 0
-# define DUMP2LOG(level, buf, len)                                  \
-    do{                                                             \
-        typeof(len) __i;                                            \
-        if (level & log_level) {                                    \
-            logger(level, "[%d]{", len);                            \
-            for (__i = 0; __i < len; __i++)                         \
-                logger_("%02x ",*((unsigned char *)(buf) + __i));   \
-            logger_("}\n");                                         \
-        }                                                           \
-    }while(0)
-#else
 
 # define DUMP2LOG(level, buf, len)              \
     do{                                         \
@@ -118,7 +104,6 @@
             log_hexdump(buf, len);              \
         }                                       \
     } while (0)
-#endif
 
 
 # define DUMP(level, buf, len)                                      \
@@ -227,23 +212,11 @@
 
 extern unsigned long log_level;
 
-#else
-# define logger(level, fmt, ...)             do{ }while(0)
-# define rawlog(level,fmt, ...)                 do{ }while(0)
-# define DUMP2LOG(level, buf, len)           do{ }while(0)
-# define DUMP(level, buf, len)               do{ }while(0)
-# define DUMP_FD2LOG(level, fdset, maxfd)    do{ }while(0)
-# define DUMP_SHORT(level, color, buf, len)  do{ }while(0)
-# define LINE2LOG                            do{ }while(0)
-# define PANICLOG                            do{ }while(0)
-# define L2L(x)                              do{ }while(0)
-# define DUMPIP2LOG(level, buf, len)         do{ }while(0)
-# warning "LOGGER disable..."
-#endif
-
-extern int logger_init(const char log_name_[],int limit_flag, ...);
-extern int logger_init_fd(int fd, int limit_flag_,...);
-extern int logger_(const char *msg, ...);
+int  logger_init(const char *filename,int limit);
+int  logger_init_fd(int fd, int limit);
+void logger_deinit();
+int  logger_(const char *msg, ...);
+char *logger_last_line();
 
 void hex_dump(FILE *f, char buf[], unsigned int len);
 void hex_dump_short(FILE *f, char buf[], unsigned int len);

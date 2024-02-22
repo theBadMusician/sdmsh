@@ -1,17 +1,26 @@
 PROJ = libstream
+BUILD_DIR = build
 
 SRC = stream.c stream_raw.c stream_ascii.c stream_tcp.c stream_popen.c
-OBJ = $(SRC:.c=.o)
+OBJ = $(SRC:%.c=$(BUILD_DIR)/%.o)
 
 CFLAGS = -W -Wall -I. -lm -ggdb -DLOGGER_ENABLED -fPIC
 
-$(PROJ): $(PROJ).so $(PROJ).a
+all: $(BUILD_DIR) $(BUILD_DIR)/$(PROJ).so $(BUILD_DIR)/$(PROJ).a
 
-$(PROJ).so: $(OBJ)
+$(BUILD_DIR)/$(PROJ).so: $(OBJ)
 	$(CC) -shared $(CFLAGS) -o $@ $^
 
-$(PROJ).a: $(OBJ)
+$(BUILD_DIR)/$(PROJ).a: $(OBJ)
 	$(AR) rcs $@ $^
 
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 clean:
-	rm -f $(PROJ).so $(PROJ).a $(OBJ) *~ .*.sw?
+	rm -f $(BUILD_DIR)/$(PROJ).so $(BUILD_DIR)/$(PROJ).a $(BUILD_DIR)/* *~ .*.sw?
+
+.PHONY: all clean

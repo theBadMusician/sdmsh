@@ -14,7 +14,6 @@
 
 
 #include <stream.h>
-#include <error.h>
 
 struct private_data_t
 {
@@ -22,162 +21,134 @@ struct private_data_t
     int error;
     // Last error operation.
     const char* error_op;
-    
-    int fd;
+
+    FILE* fp;
 };
 
-static int stream_open(sdm_stream_t *stream)
+static int stream_impl_open(stream_t *stream)
 {
-    struct private_data_t *pdata;
+    struct private_data_t *pdata = stream->pdata;
 
-    if (!stream)
-        return SDM_ERROR_STREAM;
-    pdata = stream->pdata;
-    
     if (stream->direction == STREAM_OUTPUT) {
-        pdata->fd = open(stream->args, O_CREAT|O_WRONLY, 0664);
+        pdata->fp = fopen(stream->args, "w");
     } else {
-        pdata->fd = open(stream->args, O_RDONLY);
+        pdata->fp = fopen(stream->args, "r");
     }
 
-    if (pdata->fd < 0)
-        RETURN_ERROR("opening file", errno);
-    
-    return SDM_ERROR_NONE;
+    if (!pdata->fp)
+        STREAM_RETURN_ERROR("opening file", errno);
+
+    return STREAM_ERROR_NONE;
 }
 
-static int stream_close(sdm_stream_t *stream)
+static int stream_impl_openfp(stream_t *stream, FILE *fp)
 {
-    struct private_data_t *pdata;
+    struct private_data_t *pdata = stream->pdata;
+    pdata->fp = fp;
+    return STREAM_ERROR_NONE;
+}
 
-    if (!stream)
-        return SDM_ERROR_STREAM;
-    pdata = stream->pdata;
+static int stream_impl_close(stream_t *stream)
+{
+    struct private_data_t *pdata = stream->pdata;
 
-    if (pdata->fd == -1)
+    if (!pdata->fp)
         return 0;
 
-    close(pdata->fd);
-    pdata->fd = -1;
-    
-    return SDM_ERROR_NONE;
+    fclose(pdata->fp);
+    pdata->fp = NULL;
+
+    return STREAM_ERROR_NONE;
 }
 
-static void stream_free(sdm_stream_t *stream)
+static void stream_impl_free(stream_t *stream)
 {
-    if (stream && stream->pdata) {
-        free(stream->pdata);
-        stream->pdata = NULL;
-    }
+    free(stream->pdata);
+    stream->pdata = NULL;
 }
 
-static int stream_read(const sdm_stream_t *stream, int16_t* samples, unsigned sample_count)
+static int stream_impl_read(const stream_t *stream, uint16_t* samples, unsigned sample_count)
 {
-    struct private_data_t *pdata;
+    struct private_data_t *pdata = stream->pdata;
     int rc;
 
-    if (!stream)
-        return SDM_ERROR_STREAM;
-    pdata = stream->pdata;
 
     if (stream->direction == STREAM_OUTPUT)
-        RETURN_ERROR("reading file", ENOTSUP);
+        STREAM_RETURN_ERROR("reading file", ENOTSUP);
 
-    rc = read(pdata->fd, samples, sample_count * stream->sample_size);
+    rc = fread(samples, stream->sample_size, sample_count, pdata->fp);
 
-    if (rc < 0)
-        RETURN_ERROR("reading file", errno);
+    if ((unsigned)rc != sample_count)
+        STREAM_RETURN_FP("reading file", STREAM_ERROR_IO, pdata->fp);
 
-    return rc / stream->sample_size;
+    return rc;
 }
 
-static int stream_write(sdm_stream_t *stream, void* samples, unsigned sample_count)
+static int stream_impl_write(stream_t *stream, void* samples, unsigned sample_count)
 {
-    struct private_data_t *pdata;
+    struct private_data_t *pdata = stream->pdata;
     int rc;
-    
-    if (!stream)
-        return SDM_ERROR_STREAM;
-    pdata = stream->pdata;
+
 
     if (stream->direction == STREAM_INPUT)
-        RETURN_ERROR("writing file", ENOTSUP);
+        STREAM_RETURN_ERROR("writing file", ENOTSUP);
 
-    rc = write(pdata->fd, samples, stream->sample_size * sample_count);
+    rc = fwrite(samples, stream->sample_size, sample_count, pdata->fp);
 
-    if (rc < 0)
-        RETURN_ERROR("writing file", errno);
+    if ((unsigned)rc != sample_count)
+        STREAM_RETURN_ERROR("writing file", errno);
 
-    if ((unsigned)rc != stream->sample_size * sample_count)
-        return SDM_ERROR_STREAM;
-
-    return rc / stream->sample_size;
+    return rc;
 }
 
-static int stream_get_errno(sdm_stream_t *stream)
+static int stream_impl_get_errno(stream_t *stream)
 {
-    struct private_data_t *pdata;
-
-    if (!stream)
-        return EINVAL;
-    pdata = stream->pdata;
-
+    struct private_data_t *pdata = stream->pdata;
     return pdata->error;
 }
 
-static const char* stream_strerror(sdm_stream_t *stream)
+static const char* stream_impl_strerror(stream_t *stream)
 {
-    struct private_data_t *pdata;
-
-    if (!stream)
-        return "No stream";
-    pdata = stream->pdata;
+    struct private_data_t *pdata = stream->pdata;
 
     return strerror(pdata->error);
 }
 
-static const char* stream_get_error_op(sdm_stream_t *stream)
+static const char* stream_impl_get_error_op(stream_t *stream)
 {
-    struct private_data_t *pdata;
-
-    if (!stream)
-        return "No stream";
-    pdata = stream->pdata;
+    struct private_data_t *pdata = stream->pdata;
 
     return pdata->error_op;
 }
 
-static int stream_count(sdm_stream_t* stream)
+static int stream_impl_count(stream_t* stream)
 {
+    struct private_data_t *pdata = stream->pdata;
     struct stat st;
-    struct private_data_t *pdata;
-
-    if (!stream)
-        return SDM_ERROR_STREAM;
-    pdata = stream->pdata;
 
     if (stream->direction == STREAM_OUTPUT)
-        RETURN_ERROR("counting samples in file", ENOTSUP);
+        STREAM_RETURN_ERROR("counting samples in file", ENOTSUP);
 
     if (stat(stream->args, &st) < 0)
-        RETURN_ERROR("reading file", errno);
+        STREAM_RETURN_ERROR("reading file", errno);
 
     return st.st_size / 2;
 }
 
-int sdm_stream_raw_new(sdm_stream_t *stream)
+int stream_impl_raw_new(stream_t *stream)
 {
     stream->pdata = calloc(1, sizeof(struct private_data_t));
-    stream->open = stream_open;
-    stream->close = stream_close;
-    stream->free = stream_free;
-    stream->read = stream_read;
-    stream->write = stream_write;
-    stream->get_errno = stream_get_errno;
-    stream->strerror = stream_strerror;
-    stream->get_error_op = stream_get_error_op;
-    stream->count = stream_count;
+    stream->open         = stream_impl_open;
+    stream->openfp       = stream_impl_openfp;
+    stream->close        = stream_impl_close;
+    stream->free         = stream_impl_free;
+    stream->read         = stream_impl_read;
+    stream->write        = stream_impl_write;
+    stream->get_errno    = stream_impl_get_errno;
+    stream->strerror     = stream_impl_strerror;
+    stream->get_error_op = stream_impl_get_error_op;
+    stream->count        = stream_impl_count;
     strcpy(stream->name, "RAW");
-    
-    return SDM_ERROR_NONE;
+
+    return STREAM_ERROR_NONE;
 }

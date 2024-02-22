@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <unistd.h>     /* write() */
 #include <err.h>        /* err() */
@@ -10,7 +11,8 @@
 #include <errno.h>
 #include <stdlib.h>     /* stdlib() */
 #include <assert.h>
-#include <limits.h>    /* SHORT_MAX  */
+#include <limits.h>     /* SHORT_MAX  */
+#include <sys/time.h>   /* struct timeval  */
 
 #include "sdm.h"
 
@@ -72,45 +74,105 @@ sdm_session_t* sdm_connect(char *host, int port)
 
     freeaddrinfo(resolv);
 
-    ss = malloc(sizeof(sdm_session_t));
+    ss = calloc(1, sizeof(sdm_session_t));
     if (ss == NULL)
         return NULL;
 
-    ss->sockfd = sockfd;
-    ss->rx_data = NULL;
-    ss->rx_data_len = 0;
-    ss->state = SDM_STATE_INIT;
-    ss->stream_cnt = 0;
-    ss->stream_idx = 0;
-    ss->data_len = 0;
+    ss->sockfd  = sockfd;
+    ss->state   = SDM_STATE_INIT;
+    ss->timeout = SDM_DEFAULT_TIMEOUT;
 
     return ss;
 }
 
 void sdm_close(sdm_session_t *ss)
 {
-    int i;
     close(ss->sockfd);
-    for (i = 0; i < ss->stream_cnt; i++) {
-        if (ss->stream[i]) {
-            sdm_stream_close(ss->stream[i]);
-            sdm_stream_free(ss->stream[i]);
-        }
-    }
+    streams_clean(&ss->streams);
+
     if (ss->rx_data)
         free(ss->rx_data);
+    if (ss->cmd)
+        free(ss->cmd);
     free(ss);
 }
 
-int sdm_cmd(sdm_session_t *ss, int cmd_code, ...)
+void sdm_pack_cmd(sdm_pkt_t *cmd, char *buf)
+{
+    memcpy(&buf[SDM_PKT_T_OFFSET_MAGIC], &cmd->magic, sizeof(cmd->magic));
+    memcpy(&buf[SDM_PKT_T_OFFSET_CMD],   &cmd->cmd,   sizeof(cmd->cmd));
+    switch (cmd->cmd) {
+        case SDM_CMD_CONFIG: { memcpy(&buf[SDM_PKT_T_OFFSET_THRESHOLD], &cmd->threshold,       sizeof(cmd->threshold));
+                               memcpy(&buf[SDM_PKT_T_OFFSET_GAIN_LVL],  &cmd->gain_and_srclvl, sizeof(cmd->gain_and_srclvl));
+                               break;
+                             }
+        case SDM_CMD_USBL_CONFIG:
+        case SDM_CMD_RX_JANUS:
+        case SDM_CMD_USBL_RX:
+        case SDM_CMD_RX:     { memcpy(&buf[SDM_PKT_T_OFFSET_RX_LEN],    &cmd->rx_len,          3); break; }
+        default:             { memcpy(&buf[SDM_PKT_T_OFFSET_PARAM],     &cmd->param,           sizeof(cmd->param));  break; }
+    }
+    memcpy(&buf[SDM_PKT_T_OFFSET_DATA_LEN], &cmd->data_len, sizeof(cmd->data_len));
+}
+
+void sdm_pack_reply(sdm_pkt_t *cmd, char **buf_out)
+{
+    char *buf = malloc(SDM_PKT_T_SIZE);
+
+    memcpy(&buf[SDM_PKT_T_OFFSET_MAGIC],    &cmd->magic,    sizeof(cmd->magic));
+    memcpy(&buf[SDM_PKT_T_OFFSET_CMD],      &cmd->cmd,      sizeof(cmd->cmd));
+    memcpy(&buf[SDM_PKT_T_OFFSET_PARAM],    &cmd->param,    sizeof(cmd->param));
+    memcpy(&buf[SDM_PKT_T_OFFSET_DUMMY],    &cmd->dummy,    sizeof(cmd->dummy));
+    memcpy(&buf[SDM_PKT_T_OFFSET_DATA_LEN], &cmd->data_len, sizeof(cmd->data_len));
+
+    if (cmd->data_len != 0) {
+        switch (cmd->cmd) {
+            case SDM_REPLY_RX: case SDM_REPLY_USBL_RX:
+                buf = realloc(cmd, SDM_PKT_T_SIZE + cmd->data_len * 2);
+                memcpy(&buf[SDM_PKT_T_OFFSET_DATA], cmd->data, cmd->data_len * 2);
+                break;
+        }
+    }
+    *buf_out = buf;
+}
+
+void sdm_unpack_reply(sdm_pkt_t **cmd, char *buf)
+{
+    sdm_pkt_t *c = *cmd;
+
+    memcpy(&c->magic,    &buf[SDM_PKT_T_OFFSET_MAGIC],    sizeof(c->magic));
+    memcpy(&c->cmd,      &buf[SDM_PKT_T_OFFSET_CMD],      sizeof(c->cmd));
+    memcpy(&c->param,    &buf[SDM_PKT_T_OFFSET_PARAM],    sizeof(c->param));
+    memcpy(&c->dummy,    &buf[SDM_PKT_T_OFFSET_DUMMY],    sizeof(c->dummy));
+    memcpy(&c->data_len, &buf[SDM_PKT_T_OFFSET_DATA_LEN], sizeof(c->data_len));
+
+    if (c->data_len == 0)
+        return;
+
+    switch (c->cmd) {
+        case SDM_REPLY_RX: case SDM_REPLY_USBL_RX:
+        case SDM_REPLY_SYSTIME:
+            c = realloc(c, sizeof(sdm_pkt_t) + c->data_len * 2);
+            memcpy(c->data, &buf[SDM_PKT_T_OFFSET_DATA], c->data_len * 2);
+            *cmd = c;
+            break;
+    }
+}
+
+int sdm_send(sdm_session_t *ss, int cmd_code, ...)
 {
     va_list ap;
     int n;
-    sdm_pkt_t *cmd = malloc(sizeof(sdm_pkt_t));
     char *data;
     int data_len = 0;
+    char *cmd_raw;
+    sdm_pkt_t *cmd;
 
-    memset(cmd, 0, sizeof(sdm_pkt_t));
+    if (ss == NULL)
+        return -1;
+    cmd_raw  = calloc(1, SDM_PKT_T_SIZE);
+    cmd = calloc(1, sizeof(sdm_pkt_t));
+
     cmd->magic = SDM_PKG_MAGIC;
     cmd->cmd = cmd_code;
 
@@ -122,21 +184,20 @@ int sdm_cmd(sdm_session_t *ss, int cmd_code, ...)
             uint16_t preamp_gain;
             
             va_start(ap, cmd_code);
-            cmd->threshold =       va_arg(ap, int);
-            cmd->gain_and_srclvl = va_arg(ap, int) << 7;
+            cmd->threshold        = va_arg(ap, int);
+            cmd->gain_and_srclvl  = va_arg(ap, int) << 7;
             cmd->gain_and_srclvl |= va_arg(ap, int);
             preamp_gain = (va_arg(ap, int) & 0xf) << 12;
             va_end(ap);
             data_len = cmd->data_len = 1;
-            cmd = realloc(cmd, sizeof(sdm_pkt_t) + cmd->data_len * 2);
-            memcpy(cmd->data, &preamp_gain, 2);
+            cmd_raw = realloc(cmd_raw, SDM_PKT_T_SIZE + cmd->data_len * 2);
+            memcpy(&cmd_raw[SDM_PKT_T_OFFSET_DATA], &preamp_gain, 2);
             break;
         }
         case SDM_CMD_USBL_CONFIG:
         {
             uint32_t delay, samples;
             uint32_t gain, sample_rate;
-            uint32_t tmp;
             
             va_start(ap, cmd_code);
             delay = va_arg(ap, int);
@@ -145,14 +206,13 @@ int sdm_cmd(sdm_session_t *ss, int cmd_code, ...)
             sample_rate = va_arg(ap, int);
             va_end(ap);
             
-            tmp = (gain << 4) + (sample_rate << 1);
+            cmd->rx_len = (gain << 4) + (sample_rate << 1);
 
-            memcpy(cmd->rx_len, &tmp, 3);
             data_len = cmd->data_len = 4;
-            cmd = realloc(cmd, sizeof(sdm_pkt_t) + cmd->data_len * 2);
+            cmd_raw = realloc(cmd_raw, SDM_PKT_T_SIZE + cmd->data_len * 2);
 
-            memcpy(cmd->data, &delay, 4);
-            memcpy(&cmd->data[2], &samples, 4);
+            memcpy(&cmd_raw[SDM_PKT_T_OFFSET_DATA],     &delay,   4);
+            memcpy(&cmd_raw[SDM_PKT_T_OFFSET_DATA + 4], &samples, 4);
             break;
         }
         case SDM_CMD_TX_CONTINUE:
@@ -174,8 +234,8 @@ int sdm_cmd(sdm_session_t *ss, int cmd_code, ...)
 
             /* FIXME: quick fix. Padding up to 1024 samples here */
             cmd->data_len = ((cmd->data_len + 1023) / 1024) * 1024;
-            cmd = realloc(cmd, sizeof(sdm_pkt_t) + data_len * 2);
-            memcpy(cmd->data, d, data_len * 2);
+            cmd_raw = realloc(cmd_raw, SDM_PKT_T_SIZE + data_len * 2);
+            memcpy(&cmd_raw[SDM_PKT_T_OFFSET_DATA], d, data_len * 2);
 
             va_end(ap);
             break;
@@ -190,8 +250,9 @@ int sdm_cmd(sdm_session_t *ss, int cmd_code, ...)
             data_len      = va_arg(ap, int);
             cmd->data_len = data_len;
 
-            cmd = realloc(cmd, sizeof(sdm_pkt_t) + data_len * 2);
-            memcpy(cmd->data, d, data_len * 2);
+            cmd_raw = realloc(cmd_raw, SDM_PKT_T_SIZE + data_len * 2);
+            memset(&cmd_raw[SDM_PKT_T_OFFSET_DATA], 0, data_len * 2);
+            memcpy(&cmd_raw[SDM_PKT_T_OFFSET_DATA], d, data_len * 2);
 
             va_end(ap);
             break;
@@ -199,13 +260,8 @@ int sdm_cmd(sdm_session_t *ss, int cmd_code, ...)
         case SDM_CMD_RX:
         case SDM_CMD_RX_JANUS:
         {
-            uint32_t tmp;
             va_start(ap, cmd_code);
-
-            /* max RX length 24 bit */
-            tmp = va_arg(ap, int) & 0xffffff;
-            memcpy(cmd->rx_len, &tmp, 3);
-
+            cmd->rx_len = va_arg(ap, int) & 0xffffff;
             va_end(ap);
             break;
         }
@@ -213,34 +269,35 @@ int sdm_cmd(sdm_session_t *ss, int cmd_code, ...)
         {
             uint8_t channel;
             uint16_t samples;
-            uint32_t tmp;
             
             va_start(ap, cmd_code);
             channel = va_arg(ap, int);
             samples = va_arg(ap, int);
             va_end(ap);
 
-            tmp = samples + (channel << 21);
-            memcpy(cmd->rx_len, &tmp, 3);
+            cmd->rx_len = samples + (channel << 21);
             break;
         }
         default:
             free(cmd);
+            free(cmd_raw);
             return -1;
     }
 
     if (cmd_code == SDM_CMD_TX_CONTINUE) {
         if (data_len) {
-            logger(INFO_LOG, "tx cmd continue: %d samples\n", data_len);
+            logger(TRACE_LOG, "tx cmd continue: %d samples              \n", data_len);
             n = write(ss->sockfd, data, data_len * 2);
         }
     } else {
+        sdm_pack_cmd(cmd, cmd_raw);
         logger(INFO_LOG, "tx cmd %-6s: %d samples ", sdm_cmd_to_str(cmd->cmd), data_len);
-        DUMP_SHORT(DEBUG_LOG, LGREEN, (uint8_t *)cmd, sizeof(sdm_pkt_t) + data_len * 2);
+        DUMP_SHORT(DEBUG_LOG, LGREEN, cmd_raw, SDM_PKT_T_SIZE + data_len * 2);
         logger(INFO_LOG, "\n");
-        n = write(ss->sockfd, cmd, sizeof(sdm_pkt_t) + data_len * 2);
+        n = write(ss->sockfd, cmd_raw, SDM_PKT_T_SIZE + data_len * 2);
     }
     free(cmd);
+    free(cmd_raw);
 
     if (n < 0) {
         warn("write(): ");
@@ -314,9 +371,13 @@ char* sdm_reply_report_to_str(uint8_t cmd)
 
 int sdm_show(sdm_session_t *ss, sdm_pkt_t *cmd)
 {
+    char *buf;
+
     logger((sdm_is_async_reply(cmd->cmd) ? ASYNC_LOG : INFO_LOG)
             , "\rrx cmd %-6s: ", sdm_reply_to_str(cmd->cmd));
-    DUMP_SHORT(DEBUG_LOG, YELLOW, cmd, sizeof(sdm_pkt_t));
+    sdm_pack_reply(cmd, &buf);
+    DUMP_SHORT(DEBUG_LOG, YELLOW, buf, SDM_PKT_T_SIZE);
+    free(buf);
 
     switch (cmd->cmd) {
         case SDM_REPLY_RX:
@@ -330,23 +391,15 @@ int sdm_show(sdm_session_t *ss, sdm_pkt_t *cmd)
         case SDM_REPLY_BUSY:
             logger(INFO_LOG, "%d\n", cmd->param);
             break;
-        case SDM_REPLY_SYSTIME: {
-            unsigned int current_time, tx_time, rx_time, syncin_time;
-            unsigned int *buf = (unsigned int*)ss->rx_data;
-
-            current_time = buf[0];
-            tx_time = buf[1];
-            rx_time = buf[2];
+        case SDM_REPLY_SYSTIME:
             if (cmd->data_len == 8) {
-                syncin_time = buf[3];
-                printf("current_time = %u, tx_time = %u, rx_time = %u, syncin_time = %u\n"
-                       , current_time, tx_time, rx_time, syncin_time);
+                logger (INFO_LOG, "current_time = %u, tx_time = %u, rx_time = %u, syncin_time = %u\n"
+                       , cmd->current_time, cmd->tx_time, cmd->rx_time, cmd->syncin_time);
             } else {
-                printf("current_time = %u, tx_time = %u, rx_time = %u\n"
-                       , current_time, tx_time, rx_time);
+                logger (INFO_LOG, "current_time = %u, tx_time = %u, rx_time = %u\n"
+                       , cmd->current_time, cmd->tx_time, cmd->rx_time);
             }
             break;
-        }
         case SDM_REPLY_SYNCIN:
             logger(ASYNC_LOG, "\n");
             break;
@@ -384,49 +437,26 @@ int sdm_show(sdm_session_t *ss, sdm_pkt_t *cmd)
 int sdm_save_samples(sdm_session_t *ss, char *buf, size_t len)
 {
     int error = 0;
+    int i;
 
-    for (ss->stream_idx = 0; ss->stream_idx < ss->stream_cnt; ss->stream_idx++) {
-        int rc = sdm_stream_write(ss->stream[ss->stream_idx], (int16_t*)buf, len / 2);
+    for (i = ss->streams.count - 1; i >= 0; i--) {
+        int rc = stream_write(ss->streams.streams[i], (uint16_t*)buf, len / 2);
+
         if (rc <= 0) {
             error = rc;
-            if (rc == SDM_ERROR_EOS) {
+            ss->streams.error_index = i;
+            if (rc == STREAM_ERROR_EOS) {
                 logger(INFO_LOG, "\nSink was closed: %s:%s\n",
-                        sdm_stream_get_name(ss->stream[ss->stream_idx]),
-                        sdm_stream_get_args(ss->stream[ss->stream_idx]));
+                        stream_get_name(ss->streams.streams[i]),
+                        stream_get_args(ss->streams.streams[i]));
             } else {
-                logger(ERR_LOG, "\nError %s.\n", sdm_stream_strerror(ss->stream[ss->stream_idx]));
+                logger(ERR_LOG, "\nError %s.\n", stream_strerror(ss->streams.streams[i]));
             }
-            sdm_stream_close(ss->stream[ss->stream_idx]);
-            sdm_stream_free(ss->stream[ss->stream_idx]);
-            if (ss->stream_idx != ss->stream_cnt) {
-                memmove(&ss->stream[ss->stream_idx], &ss->stream[ss->stream_idx + 1], ss->stream_cnt - ss->stream_idx);
-                ss->stream_idx--;
-            }
-            ss->stream_cnt--;
+            streams_remove(&ss->streams, i);
         }
     }
 
     return error;
-}
-
-int sdm_load_samples(sdm_session_t *ss, int16_t *samples, size_t len)
-{
-    if (ss->stream_cnt == 1) {
-        return sdm_stream_read(ss->stream[0], samples, len);
-    } else {
-        return -1;
-    }
-}
-
-int sdm_free_streams(sdm_session_t *ss)
-{
-    int i;
-    for (i = 0; i < ss->stream_cnt; i++) {
-        sdm_stream_close(ss->stream[i]);
-        sdm_stream_free(ss->stream[i]);
-    }
-    ss->stream_cnt = 0;
-    return 0;
 }
 
 int sdm_extract_reply(char *buf, size_t len, sdm_pkt_t **cmd)
@@ -435,12 +465,12 @@ int sdm_extract_reply(char *buf, size_t len, sdm_pkt_t **cmd)
     uint64_t magic = SDM_PKG_MAGIC;
     int find = 0;
 
-    if (len < sizeof(sdm_pkt_t)) {
+    if (len < SDM_PKT_T_SIZE) {
         *cmd = NULL;
         return 0;
     }
 
-    for (i = 0; i < len && (len - i) >= sizeof(sdm_pkt_t); i++)
+    for (i = 0; i < len && (len - i) >= SDM_PKT_T_SIZE; i++)
         if (!memcmp(buf + i, &magic, sizeof(magic))) {
             find = 1;
             break;
@@ -451,8 +481,9 @@ int sdm_extract_reply(char *buf, size_t len, sdm_pkt_t **cmd)
         return i;
     }
 
-    *cmd = (sdm_pkt_t*)(buf + i);
-    return sizeof(sdm_pkt_t) + i;
+    *cmd = calloc(1, sizeof(sdm_pkt_t));
+    sdm_unpack_reply(cmd, buf + i);
+    return SDM_PKT_T_SIZE + i;
 }
 
 void sdm_set_idle_state(sdm_session_t *ss)
@@ -517,11 +548,11 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
         return 0;
 
     /* clear last received command */
-    memset(&ss->cmd, 0, sizeof(sdm_pkt_t));
     if (buf && len > 0) {
         sdm_buf_resize(ss, buf, len);
     }
     handled = sdm_extract_reply(ss->rx_data, ss->rx_data_len, &cmd);
+    data_len = handled - SDM_PKT_T_SIZE;
     /* if we have not 16bit aligned data, we will skip last byte for this time */
     handled -= (handled % 2);
     if(handled == 0)
@@ -531,7 +562,7 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
         int rc = sdm_save_samples(ss, ss->rx_data, handled);
         if (rc < 0) {
             logger(INFO_LOG, "\n%d samples was dropped.\n", handled);
-            if (rc == SDM_ERROR_EOS)
+            if (rc == STREAM_ERROR_EOS)
                 return SDM_ERR_SAVE_EOF;
             return SDM_ERR_SAVE_FAIL;
         }
@@ -541,13 +572,11 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
         return handled;
     }
 
-    data_len = ((char *)cmd - ss->rx_data);
-
     if (ss->state == SDM_STATE_RX && data_len != 0) {
         int rc = sdm_save_samples(ss, ss->rx_data, data_len);
         if (rc < 0) {
             logger(INFO_LOG, "\n%d samples was dropped.\n", handled);
-            if (rc == SDM_ERROR_EOS)
+            if (rc == STREAM_ERROR_EOS)
                 return SDM_ERR_SAVE_EOF;
             return SDM_ERR_SAVE_FAIL;
         }
@@ -555,15 +584,19 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
     }
 
     /* store in sdm_session structure last received package */
-    memcpy(&ss->cmd, cmd, sizeof(sdm_pkt_t));
-    sdm_buf_resize(ss, NULL, -handled);
-    sdm_show(ss, &ss->cmd);
+    /* memcpy(&ss->cmd, cmd, sizeof(sdm_pkt_t) + cmd->data_len * 2); */
+    if (ss->cmd != NULL)
+        free(ss->cmd);
+    ss->cmd = cmd;
 
-    switch (ss->cmd.cmd) {
+    sdm_buf_resize(ss, NULL, -handled);
+    sdm_show(ss, ss->cmd);
+
+    switch (ss->cmd->cmd) {
         case SDM_REPLY_STOP:
-            if (ss->stream_cnt) {
+            if (ss->streams.count) {
                 logger(INFO_LOG, "\nReceiving %d samples is done.\n", ss->data_len / 2);
-                sdm_free_streams(ss);
+                streams_clean(&ss->streams);
                 sdm_set_idle_state(ss);
             }
             ss->state = SDM_STATE_IDLE;
@@ -577,13 +610,13 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
 
         case SDM_REPLY_SYSTIME:
             /* cmd->data_len in header in uint16 count */
-            if (handled - data_len < (int)ss->cmd.data_len * 2) {
-                logger(INFO_LOG, "\rwaiting %d bytes\r", ss->cmd.data_len * 2 - handled - data_len);
+            if (handled - data_len < (int)ss->cmd->data_len * 2) {
+                logger(INFO_LOG, "\rwaiting %d bytes\r", ss->cmd->data_len * 2 - handled - data_len);
                 return 0;
             }
 
-            sdm_buf_resize(ss, NULL, -ss->cmd.data_len * 2);
-            handled += ss->cmd.data_len * 2;
+            sdm_buf_resize(ss, NULL, -ss->cmd->data_len * 2);
+            handled += ss->cmd->data_len * 2;
 
             sdm_set_idle_state(ss);
             ss->state = SDM_STATE_IDLE;
@@ -592,15 +625,15 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
 
         case SDM_REPLY_JANUS_DETECTED:
             /* cmd->data_len in header in uint16 count */
-            if (handled - data_len < (int)ss->cmd.data_len * 2) {
-                logger(INFO_LOG, "\rwaiting %d bytes\r", ss->cmd.data_len * 2 - handled - data_len);
+            if (handled - data_len < (int)ss->cmd->data_len * 2) {
+                logger(INFO_LOG, "\rwaiting %d bytes\r", ss->cmd->data_len * 2 - handled - data_len);
                 return 0;
             }
 
             sdm_handle_janus_detect(ss);
 
-            sdm_buf_resize(ss, NULL, -ss->cmd.data_len * 2);
-            handled += ss->cmd.data_len * 2;
+            sdm_buf_resize(ss, NULL, -ss->cmd->data_len * 2);
+            handled += ss->cmd->data_len * 2;
 
             return handled;
 
@@ -613,7 +646,7 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
             ss->state = SDM_STATE_IDLE;
 
             /* handle replays what can be interpreted as errors */
-            switch (ss->cmd.param) {
+            switch (ss->cmd->param) {
                 case SDM_REPLY_REPORT_TX_STOP:
                     /* TODO: check "sent" == "reported" number of sample */
                     break;
@@ -629,7 +662,7 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
                 case SDM_REPLY_REPORT_REF:
                 case SDM_REPLY_REPORT_CONFIG:
                 case SDM_REPLY_REPORT_USBL_CONFIG:
-                    if (ss->cmd.data_len == 0)
+                    if (ss->cmd->data_len == 0)
                         return -1;
             }
             return handled;
@@ -641,96 +674,209 @@ int sdm_handle_rx_data(sdm_session_t *ss, char *buf, int len)
     return -1;
 }
 
-int sdm_rx(sdm_session_t *ss, int cmd, ...)
+static int sdm_expect_v(sdm_session_t *ssl[],  struct timeval *hard_timeout, int cmd, va_list ap)
 {
     int len = 0;
     char buf[BUFSIZE];
+    struct timeval tv, *ptv;
+    struct timeval time_limit_start = {0};
 
+    if (hard_timeout != NULL) {
+        if (gettimeofday(&time_limit_start, NULL)) {
+            logger(ERR_LOG, "expect: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+
+    logger(INFO_LOG, "expect(%s)\n", sdm_reply_to_str(cmd));
     for (;;) {
-        int rc;
+        int rc, i;
         static fd_set rfds;
-        static struct timeval tv;
-        static int maxfd;
+        static int maxfd = 0;
+        sdm_session_t *ss;
 
         FD_ZERO(&rfds);
-        FD_SET(ss->sockfd, &rfds);
-        tv.tv_sec  = 1;
+
+        ptv = &tv;
         tv.tv_usec = 0;
+        for (i = 0; ssl[i]; i++) {
+            ss = ssl[i];
+            FD_SET(ss->sockfd, &rfds);
 
-        maxfd = ss->sockfd;
+            if (maxfd < ss->sockfd)
+                maxfd = ss->sockfd;
 
-        /* if (ss->state != SDM_STATE_WAIT_REPLY) { */
-            /* return 0; */
-        /* } */
-
-        rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-
-        if (rc == -1)
-            err(1, "select()");
-
-        /* timeout */
-        if (!rc) {
-            if (ss->state == SDM_STATE_INIT)
-                ss->state = SDM_STATE_IDLE;
-            continue;
-        }
-
-        if (FD_ISSET(ss->sockfd, &rfds)) {
-            len = read(ss->sockfd, buf, sizeof(buf));
-
-            if (len == 0)
+            if (ss->state == SDM_STATE_INIT) {
+                tv.tv_sec  = 0;
+                tv.tv_usec = 10000;
                 break;
-
-            if (len < 0)
-                err(1, "read(): ");
-
-             rc = sdm_handle_rx_data(ss, buf, len);
-            if (ss->rx_data_len == 0 || rc == 0) {
-                if (ss->cmd.cmd == cmd) {
-                    if (cmd == SDM_REPLY_REPORT) {
-                        int rr;
-                        va_list ap;
-                        va_start(ap, cmd);
-                        rr    = va_arg(ap, int);
-                        if (ss->cmd.param == rr) {
-                            switch (rr) {
-                                case SDM_REPLY_REPORT_NO_SDM_MODE: return 0;
-                                case SDM_REPLY_REPORT_TX_STOP:     return 0;
-                                case SDM_REPLY_REPORT_RX_STOP:     return 0;
-                                case SDM_REPLY_REPORT_REF:         return va_arg(ap, unsigned int) == ss->cmd.data_len;
-                                case SDM_REPLY_REPORT_CONFIG:      return va_arg(ap, unsigned int) == ss->cmd.data_len;
-                                case SDM_REPLY_REPORT_USBL_CONFIG: return va_arg(ap, unsigned int) == ss->cmd.data_len;
-                                case SDM_REPLY_REPORT_USBL_RX_STOP:return 0;
-                                case SDM_REPLY_REPORT_DROP:        return 0;
-                                case SDM_REPLY_REPORT_SYSTIME:     return 0;
-                                case SDM_REPLY_REPORT_UNKNOWN:     return 0;
-                                default:                            return 1;
-                            }
-                        }
-                        va_end(ap);
-                    }
-                    if (cmd == SDM_REPLY_STOP) {
-                        return 0;
-                    }
-                    if (cmd == SDM_REPLY_RX) {
-                        return 0;
-                    }
-                    if (cmd == SDM_REPLY_RX_JANUS) {
-                        return 0;
-                    }
-                    if (cmd == SDM_REPLY_USBL_RX) {
-                        return 0;
-                    }
-                    if (cmd == SDM_REPLY_SYNCIN) {
-                        return 0;
-                    }
-                    if (cmd == SDM_REPLY_BUSY) {
-                        return 0;
-                    }
-                    return 1;
+            } else if (ss->timeout != -1) {
+                if (ss->timeout * 1000 < tv.tv_usec) {
+                    tv.tv_sec  = 0;
+                    tv.tv_usec = ss->timeout * 1000;
                 }
             }
         }
+
+        if (hard_timeout != NULL) {
+            struct timeval now, delta;
+            if (gettimeofday(&now, NULL)) {
+                logger(ERR_LOG, "expect: %s\n", strerror(errno));
+                return -1;
+            }
+            timersub(&now, &time_limit_start, &delta);
+            
+            if (!timercmp(&delta, hard_timeout, <=))
+                return SDM_ERR_TIMEOUT;
+
+            if (!timercmp(&delta, hard_timeout, >))
+                memcpy(&tv, hard_timeout, sizeof(tv));
+
+        } else if (tv.tv_usec == 0)
+            ptv = NULL;
+
+        rc = select(maxfd + 1, &rfds, NULL, NULL, ptv);
+
+        if (rc == -1) {
+            logger(ERR_LOG, "expect: %s\n", strerror(errno));
+            return -1;
+        }
+
+        if (hard_timeout != NULL) {
+            struct timeval now, delta;
+            if (gettimeofday(&now, NULL)) {
+                logger(ERR_LOG, "expect: %s\n", strerror(errno));
+                return -1;
+            }
+            timersub(&now, &time_limit_start, &delta);
+            
+            if (!timercmp(&delta, hard_timeout, <=))
+                return SDM_ERR_TIMEOUT;
+        }
+
+        for (i = 0; ssl[i]; i++) {
+            ss = ssl[i];
+            /* timeout */
+            if (!rc) {
+                if (ss->state == SDM_STATE_INIT) {
+                    ss->state = SDM_STATE_IDLE;
+                    return 0;
+                }
+
+                if (ss->timeout != -1 && hard_timeout == NULL)
+                    return SDM_ERR_TIMEOUT;
+
+                goto expect_v_loop_continue;
+            }
+
+            if (FD_ISSET(ss->sockfd, &rfds)) {
+                int state = ss->state;
+                int len_orig;
+                len_orig = len = read(ss->sockfd, buf, sizeof(buf));
+
+                if (len == 0)
+                    goto expect_v_loop_break;
+
+                if (len < 0) {
+                    logger(ERR_LOG, "expect(): %s\n", strerror(errno));
+                    return -1;
+                }
+
+                do {
+                    rc = sdm_handle_rx_data(ss, buf, len);
+
+                    if (len && (cmd == SDM_REPLY_SYNCIN || (ss->cmd && !sdm_is_async_reply(ss->cmd->cmd))))
+                        if (ss->rx_data_len == 0 || rc == 0) {
+
+                            if (ss->cmd->cmd == cmd) {
+                                if (cmd == SDM_REPLY_REPORT) {
+                                    int rr;
+                                    rr    = va_arg(ap, int);
+                                    if (ss->cmd->param == rr) {
+                                        switch (rr) {
+                                            case SDM_REPLY_REPORT_NO_SDM_MODE: return 0;
+                                            case SDM_REPLY_REPORT_TX_STOP:     return 0;
+                                            case SDM_REPLY_REPORT_RX_STOP:     return 0;
+                                            case SDM_REPLY_REPORT_REF:         return va_arg(ap, unsigned int) == ss->cmd->data_len;
+                                            case SDM_REPLY_REPORT_CONFIG:      return va_arg(ap, unsigned int) == ss->cmd->data_len;
+                                            case SDM_REPLY_REPORT_USBL_CONFIG: return va_arg(ap, unsigned int) == ss->cmd->data_len;
+                                            case SDM_REPLY_REPORT_USBL_RX_STOP:return 0;
+                                            case SDM_REPLY_REPORT_DROP:        return 0;
+                                            case SDM_REPLY_REPORT_SYSTIME:     return 0;
+                                            case SDM_REPLY_REPORT_UNKNOWN:     return 0;
+                                            default:                            return 1;
+                                        }
+                                    }
+                                }
+                                if (cmd == SDM_REPLY_STOP) {
+                                    return 0;
+                                }
+                                if (cmd == SDM_REPLY_RX) {
+                                    return 0;
+                                }
+                                if (cmd == SDM_REPLY_RX_JANUS) {
+                                    return 0;
+                                }
+                                if (cmd == SDM_REPLY_USBL_RX) {
+                                    return 0;
+                                }
+                                if (cmd == SDM_REPLY_SYNCIN) {
+                                    return 0;
+                                }
+                                if (cmd == SDM_REPLY_BUSY) {
+                                    return 0;
+                                }
+                                return 1;
+                            }
+                        }
+                    len = 0;
+                } while (rc > 0);
+
+                if (rc < 0) {
+                    if (rc == SDM_ERR_SAVE_FAIL || rc == SDM_ERR_SAVE_EOF)
+                        sdm_send(ss, SDM_CMD_STOP);
+                }
+
+                if (state == SDM_STATE_INIT) {
+                    logger(WARN_LOG, "Skip %d received bytes in SDM_STATE_INIT state\n", len_orig);
+                    ss->state = SDM_STATE_INIT;
+                    goto expect_v_loop_continue;
+                }
+
+            }
+        }
+expect_v_loop_continue:;
     }
+expect_v_loop_break:;
     return 0;
 }
+
+int sdm_expect(sdm_session_t *ss, int cmd, ...)
+{
+    va_list ap;
+    int rc;
+    sdm_session_t *ssl[] = {ss, NULL};
+
+    va_start(ap, cmd);
+    rc = sdm_expect_v(ssl, NULL, cmd, ap);
+    va_end(ap);
+
+    return rc;
+}
+
+int sdm_receive_data_time_limit(sdm_session_t *ssl[], long time_limit)
+{
+    va_list ap;
+    int rc, i;
+    struct timeval tv = { .tv_usec = time_limit * 1000 };
+    sdm_session_t *ss;
+
+    rc = sdm_expect_v(ssl, &tv, -1, ap);
+    for (i = 0; ssl[i]; i++) {
+        ss = ssl[i];
+        sdm_send(ss, SDM_CMD_STOP);
+    }
+
+    return rc;
+}
+
